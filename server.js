@@ -581,19 +581,24 @@ function adminAuth(req, res, next) {
 app.post('/api/admin/login', async (req, res) => {
   try {
     const { email, password } = req.body;
+    console.log('Admin login attempt:', email);
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
     if (email !== ADMIN_EMAIL) return res.status(401).json({ error: 'Invalid credentials' });
 
     const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-    if (result.rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
+    console.log('User found:', result.rows.length > 0);
+    if (result.rows.length === 0) return res.status(401).json({ error: 'Admin account not found' });
 
     const user = result.rows[0];
     const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+    console.log('Password valid:', valid);
+    if (!valid) return res.status(401).json({ error: 'Invalid password' });
 
     const token = generateToken(user);
     res.json({ token });
   } catch (err) {
-    res.status(500).json({ error: 'Server error' });
+    console.error('Admin login error:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
