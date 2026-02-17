@@ -558,6 +558,147 @@ app.get('/api/stripe/status', auth, async (req, res) => {
 // ADMIN / STATS
 // ============================================================
 
+// ============================================================
+// ADMIN ROUTES
+// ============================================================
+
+const ADMIN_EMAIL = 'brandon@luxurycoachexchange.com';
+
+function adminAuth(req, res, next) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'No token' });
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    if (decoded.email !== ADMIN_EMAIL) return res.status(403).json({ error: 'Not admin' });
+    req.user = decoded;
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+// Admin login
+app.post('/api/admin/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (email !== ADMIN_EMAIL) return res.status(401).json({ error: 'Invalid credentials' });
+
+    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    if (result.rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
+
+    const user = result.rows[0];
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+
+    const token = generateToken(user);
+    res.json({ token });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Admin dashboard stats
+app.get('/api/admin/dashboard', adminAuth, async (req, res) => {
+  try {
+    const users = await pool.query('SELECT COUNT(*) FROM users');
+    const sellers = await pool.query("SELECT COUNT(*) FROM users WHERE role IN ('seller','both')");
+    const buyers = await pool.query("SELECT COUNT(*) FROM users WHERE role IN ('buyer','both')");
+    const paidSellers = await pool.query('SELECT COUNT(*) FROM users WHERE paid = true');
+    const listings = await pool.query("SELECT COUNT(*) FROM listings WHERE status = 'active'");
+    const conversations = await pool.query('SELECT COUNT(*) FROM conversations');
+    const messages = await pool.query('SELECT COUNT(*) FROM messages');
+    const revenue = await pool.query('SELECT COUNT(*) as cnt FROM users WHERE paid = true');
+
+    res.json({
+      total_users: parseInt(users.rows[0].count),
+      sellers: parseInt(sellers.rows[0].count),
+      buyers: parseInt(buyers.rows[0].count),
+      paid_sellers: parseInt(paidSellers.rows[0].count),
+      active_listings: parseInt(listings.rows[0].count),
+      conversations: parseInt(conversations.rows[0].count),
+      messages: parseInt(messages.rows[0].count),
+      revenue: parseInt(revenue.rows[0].cnt) * 500
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// All users
+app.get('/api/admin/users', adminAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, name, email, role, phone, paid, paid_at, created_at FROM users ORDER BY created_at DESC'
+    );
+    res.json({ users: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// All listings
+app.get('/api/admin/listings', adminAuth, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT l.*, u.name as seller_name, u.email as seller_email,
+        (SELECT url FROM listing_photos WHERE listing_id = l.id ORDER BY sort_order LIMIT 1) as photo_url
+      FROM listings l
+      JOIN users u ON l.seller_id = u.id
+      ORDER BY l.created_at DESC
+    `);
+    res.json({ listings: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// All conversations with messages
+app.get('/api/admin/conversations', adminAuth, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT c.*, 
+        buyer.name as buyer_name, buyer.email as buyer_email,
+        seller.name as seller_name, seller.email as seller_email,
+        l.year, l.converter, l.model, l.price_display,
+        (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id)::int as message_count,
+        (SELECT text FROM messages WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1) as last_message
+      FROM conversations c
+      JOIN users buyer ON c.buyer_id = buyer.id
+      JOIN users seller ON c.seller_id = seller.id
+      JOIN listings l ON c.listing_id = l.id
+      ORDER BY c.updated_at DESC
+    `);
+    res.json({ conversations: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Recent activity feed
+app.get('/api/admin/activity', adminAuth, async (req, res) => {
+  try {
+    const signups = await pool.query(
+      "SELECT id, name, email, role, created_at, 'signup' as type FROM users ORDER BY created_at DESC LIMIT 20"
+    );
+    const payments = await pool.query(
+      "SELECT id, name, email, paid_at as created_at, 'payment' as type FROM users WHERE paid = true ORDER BY paid_at DESC LIMIT 20"
+    );
+    const msgs = await pool.query(`
+      SELECT m.id, u.name, m.text, m.created_at, 'message' as type 
+      FROM messages m JOIN users u ON m.sender_id = u.id 
+      ORDER BY m.created_at DESC LIMIT 20
+    `);
+
+    const all = [...signups.rows, ...payments.rows, ...msgs.rows]
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+      .slice(0, 30);
+
+    res.json({ activity: all });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 app.get('/api/stats', async (req, res) => {
   try {
     const listings = await pool.query("SELECT COUNT(*) FROM listings WHERE status = 'active'");
@@ -576,6 +717,22 @@ app.get('/api/stats', async (req, res) => {
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// One-time admin seed — remove after first use
+app.get('/api/seed-admin', async (req, res) => {
+  try {
+    const existing = await pool.query('SELECT id FROM users WHERE email = $1', ['brandon@luxurycoachexchange.com']);
+    if (existing.rows.length > 0) return res.json({ message: 'Admin already exists' });
+    const hash = await bcrypt.hash('Luxurycoach$!', 12);
+    await pool.query(
+      'INSERT INTO users (name, email, password_hash, role) VALUES ($1, $2, $3, $4)',
+      ['Brandon', 'brandon@luxurycoachexchange.com', hash, 'both']
+    );
+    res.json({ success: true, message: 'Admin account created' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ============================================================
